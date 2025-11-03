@@ -128,6 +128,7 @@ import org.florisboard.lib.snygg.ui.SnyggRow
 import org.florisboard.lib.snygg.ui.SnyggSurfaceView
 import org.florisboard.lib.snygg.ui.SnyggText
 import org.florisboard.lib.snygg.ui.rememberSnyggThemeQuery
+import kotlin.math.roundToInt
 
 /**
  * Global weak reference for the [FlorisImeService] class. This is needed as certain actions (request hide, switch to
@@ -269,6 +270,16 @@ class FlorisImeService : LifecycleInputMethodService() {
     private var isExtractUiShown by mutableStateOf(false)
     private var resourcesContext by mutableStateOf(this as Context)
 
+    /* for dual screen handhelds */
+    private var dockMode = true
+    private var dockRectPx = android.graphics.Rect(
+        0,
+        (resources.displayMetrics.heightPixels * 0.75 /* 0.75 = 3 / 4 */).roundToInt(),
+        resources.displayMetrics.widthPixels,
+        resources.displayMetrics.heightPixels
+    ) /* default to bottom screen */
+    private var bottomSheetAdded = false
+
     private val wallpaperChangeReceiver = WallpaperChangeReceiver()
 
     init {
@@ -278,7 +289,7 @@ class FlorisImeService : LifecycleInputMethodService() {
     override fun onCreate() {
         super.onCreate()
         FlorisImeServiceReference = WeakReference(this)
-        WindowCompat.setDecorFitsSystemWindows(window.window!!, false)
+        // WindowCompat.setDecorFitsSystemWindows(window.window!!, false)
         subtypeManager.activeSubtypeFlow.collectIn(lifecycleScope) { subtype ->
             val config = Configuration(resources.configuration)
             if (prefs.localization.displayKeyboardLabelsInSubtypeLanguage.get()) {
@@ -302,13 +313,31 @@ class FlorisImeService : LifecycleInputMethodService() {
 
     override fun onCreateInputView(): View {
         super.installViewTreeOwners()
-        // Instantiate and install bottom sheet host UI view
-        val bottomSheetView = FlorisBottomSheetHostUiView()
-        window.window!!.findViewById<ViewGroup>(android.R.id.content).addView(bottomSheetView)
         // Instantiate and return input view
+        if (!bottomSheetAdded) {
+            window?.window
+                ?.findViewById<ViewGroup>(android.R.id.content)
+                ?.let { host ->
+                    host.addView(FlorisBottomSheetHostUiView())
+                    bottomSheetAdded = true
+                }
+        }
+
         val composeView = ComposeInputView()
         inputWindowView = composeView
         return composeView
+    }
+
+    /* for dual screen handhelds */
+    private fun positionRootInDock(root: View, rect: android.graphics.Rect) {
+        root.post {
+            val lp = (root.layoutParams ?: ViewGroup.LayoutParams(rect.width(), ViewGroup.LayoutParams.WRAP_CONTENT))
+            lp.width = rect.width()
+            lp.height = ViewGroup.LayoutParams.WRAP_CONTENT
+            root.layoutParams = lp
+            root.translationX = rect.left.toFloat()
+            root.translationY = rect.top.toFloat()
+        }
     }
 
     override fun onCreateCandidatesView(): View? {
@@ -366,7 +395,29 @@ class FlorisImeService : LifecycleInputMethodService() {
             activeState.isSelectionMode = editorInfo.initialSelection.isSelectionMode
             editorInstance.handleStartInputView(editorInfo, isRestart = restarting)
         }
+
+        inputWindowView?.post {
+            val root = inputWindowView ?: return@post
+            val w = root.width
+            val h = root.height
+            if (dockMode) {
+                if (dockRectPx.isEmpty) {
+                    dockRectPx = android.graphics.Rect(0, (h * 0.75f).toInt(), w, h)
+                } else {
+                    dockRectPx = clampToWindow(dockRectPx, w, h)
+                }
+                positionRootInDock(root, dockRectPx)
+            }
+        }
     }
+
+    private fun clampToWindow(r: android.graphics.Rect, w: Int, h: Int) =
+        android.graphics.Rect(
+            r.left.coerceIn(0, w),
+            r.top.coerceIn(0, h),
+            r.right.coerceIn(0, w).coerceAtLeast(r.left.coerceIn(0, w)),
+            r.bottom.coerceIn(0, h).coerceAtLeast(r.top.coerceIn(0, h))
+        )
 
     override fun onEvaluateInputViewShown(): Boolean {
         val config = resources.configuration
@@ -410,14 +461,15 @@ class FlorisImeService : LifecycleInputMethodService() {
 
     override fun onWindowShown() {
         super.onWindowShown()
-        if (isWindowShown) {
-            flogWarning(LogTopic.IMS_EVENTS) { "Ignoring (is already shown)" }
-            return
-        } else {
-            flogInfo(LogTopic.IMS_EVENTS)
-        }
         isWindowShown = true
-        inputFeedbackController.updateSystemPrefsState()
+        window?.window?.let { w ->
+            WindowCompat.setDecorFitsSystemWindows(w, false)
+            if (!bottomSheetAdded) {
+                w.findViewById<ViewGroup>(android.R.id.content)
+                    ?.addView(FlorisBottomSheetHostUiView())
+                bottomSheetAdded = true
+            }
+        }
     }
 
     override fun onWindowHidden() {
@@ -437,6 +489,9 @@ class FlorisImeService : LifecycleInputMethodService() {
     }
 
     override fun onEvaluateFullscreenMode(): Boolean {
+        if (dockMode) {
+            return true
+        } /* for dual screen handhelds */
         val config = resources.configuration
         if (config.orientation != Configuration.ORIENTATION_LANDSCAPE) {
             return false
@@ -512,6 +567,25 @@ class FlorisImeService : LifecycleInputMethodService() {
         super.onComputeInsets(outInsets)
         if (outInsets == null) return
 
+        if (dockMode) {
+            val root = inputWindowView ?: return
+            val w = root.width.takeIf { it > 0 } ?: return
+            val h = root.height.takeIf { it > 0 } ?: return
+
+            if (!isInputViewShown) {
+                outInsets.contentTopInsets = h
+                outInsets.visibleTopInsets = h
+                return
+            }
+
+            val dock = clampToWindow(dockRectPx, w, h)
+            outInsets.touchableInsets = Insets.TOUCHABLE_INSETS_REGION
+            outInsets.touchableRegion.set(dock.left, dock.top, dock.right, dock.bottom)
+            outInsets.contentTopInsets = h
+            outInsets.visibleTopInsets = h
+            return
+        }
+
         val inputWindowView = inputWindowView ?: return
         // TODO: Check also if the keyboard is currently suppressed by a hardware keyboard
         if (!isInputViewShown) {
@@ -548,18 +622,20 @@ class FlorisImeService : LifecycleInputMethodService() {
     private fun updateSoftInputWindowLayoutParameters() {
         val w = window?.window ?: return
         // TODO: Verify that this doesn't give us a padding problem
-        WindowCompat.setDecorFitsSystemWindows(w, false)
+        androidx.core.view.WindowCompat.setDecorFitsSystemWindows(w, false)
+
         ViewUtils.updateLayoutHeightOf(w, WindowManager.LayoutParams.MATCH_PARENT)
-        val layoutHeight = if (isFullscreenUiMode) {
-            WindowManager.LayoutParams.WRAP_CONTENT
-        } else {
-            WindowManager.LayoutParams.MATCH_PARENT
-        }
+
+        val layoutHeight =
+            if (isFullscreenUiMode) WindowManager.LayoutParams.MATCH_PARENT
+            else WindowManager.LayoutParams.WRAP_CONTENT
+
         val inputArea = w.findViewById<View>(android.R.id.inputArea) ?: return
         ViewUtils.updateLayoutHeightOf(inputArea, layoutHeight)
         ViewUtils.updateLayoutGravityOf(inputArea, Gravity.BOTTOM)
-        val inputWindowView = inputWindowView ?: return
-        ViewUtils.updateLayoutHeightOf(inputWindowView, layoutHeight)
+
+        val v = inputWindowView ?: return
+        ViewUtils.updateLayoutHeightOf(v, layoutHeight)
     }
 
     override fun getTextForImeAction(imeOptions: Int): String? {
