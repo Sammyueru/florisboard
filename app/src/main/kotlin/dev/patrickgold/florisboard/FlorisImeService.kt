@@ -271,7 +271,7 @@ class FlorisImeService : LifecycleInputMethodService() {
     private var resourcesContext by mutableStateOf(this as Context)
 
     /* for dual screen handhelds */
-    private var dockMode = true
+    private var dockMode = false
     private var dockRectPx = android.graphics.Rect(
         0,
         (resources.displayMetrics.heightPixels * 0.75 /* 0.75 = 3 / 4 */).roundToInt(),
@@ -281,6 +281,8 @@ class FlorisImeService : LifecycleInputMethodService() {
     private var bottomSheetAdded = false
 
     private val wallpaperChangeReceiver = WallpaperChangeReceiver()
+
+    private val BOTTOM_SHEET_TAG = "floris_bottomsheet_host"
 
     init {
         setTheme(R.style.FlorisImeTheme)
@@ -313,16 +315,7 @@ class FlorisImeService : LifecycleInputMethodService() {
 
     override fun onCreateInputView(): View {
         super.installViewTreeOwners()
-        // Instantiate and return input view
-        if (!bottomSheetAdded) {
-            window?.window
-                ?.findViewById<ViewGroup>(android.R.id.content)
-                ?.let { host ->
-                    host.addView(FlorisBottomSheetHostUiView())
-                    bottomSheetAdded = true
-                }
-        }
-
+        ensureBottomSheetHost()
         val composeView = ComposeInputView()
         inputWindowView = composeView
         return composeView
@@ -398,14 +391,10 @@ class FlorisImeService : LifecycleInputMethodService() {
 
         inputWindowView?.post {
             val root = inputWindowView ?: return@post
-            val w = root.width
-            val h = root.height
-            if (dockMode) {
-                if (dockRectPx.isEmpty) {
-                    dockRectPx = android.graphics.Rect(0, (h * 0.75f).toInt(), w, h)
-                } else {
-                    dockRectPx = clampToWindow(dockRectPx, w, h)
-                }
+            val w = root.width; val h = root.height
+            if (w > 0 && h > 0 && dockMode) {
+                dockRectPx = if (dockRectPx.isEmpty) android.graphics.Rect(0, (h * 0.75f).toInt(), w, h)
+                else clampToWindow(dockRectPx, w, h)
                 positionRootInDock(root, dockRectPx)
             }
         }
@@ -459,17 +448,20 @@ class FlorisImeService : LifecycleInputMethodService() {
         NlpInlineAutofill.clearInlineSuggestions()
     }
 
+    private fun ensureBottomSheetHost() {
+        val host = window?.window?.findViewById<ViewGroup>(android.R.id.content) ?: return
+        val tag = "floris_bottomsheet_host"
+        if (host.findViewWithTag<View>(tag) == null) {
+            val v = FlorisBottomSheetHostUiView().apply { this.tag = tag }
+            host.addView(v)
+        }
+    }
+
     override fun onWindowShown() {
         super.onWindowShown()
         isWindowShown = true
-        window?.window?.let { w ->
-            WindowCompat.setDecorFitsSystemWindows(w, false)
-            if (!bottomSheetAdded) {
-                w.findViewById<ViewGroup>(android.R.id.content)
-                    ?.addView(FlorisBottomSheetHostUiView())
-                bottomSheetAdded = true
-            }
-        }
+        window?.window?.let { WindowCompat.setDecorFitsSystemWindows(it, false) }
+        ensureBottomSheetHost()
     }
 
     override fun onWindowHidden() {
@@ -490,16 +482,14 @@ class FlorisImeService : LifecycleInputMethodService() {
 
     override fun onEvaluateFullscreenMode(): Boolean {
         if (dockMode) {
-            return true
-        } /* for dual screen handhelds */
-        val config = resources.configuration
-        if (config.orientation != Configuration.ORIENTATION_LANDSCAPE) {
-            return false
+            return window?.window != null || super.onEvaluateFullscreenMode()
         }
+        val config = resources.configuration
+        if (config.orientation != Configuration.ORIENTATION_LANDSCAPE) return false
         return when (prefs.keyboard.landscapeInputUiMode.get()) {
             LandscapeInputUiMode.DYNAMICALLY_SHOW -> super.onEvaluateFullscreenMode()
-            LandscapeInputUiMode.NEVER_SHOW -> false
-            LandscapeInputUiMode.ALWAYS_SHOW -> true
+            LandscapeInputUiMode.NEVER_SHOW       -> false
+            LandscapeInputUiMode.ALWAYS_SHOW      -> true
         }
     }
 
@@ -565,55 +555,63 @@ class FlorisImeService : LifecycleInputMethodService() {
 
     override fun onComputeInsets(outInsets: Insets?) {
         super.onComputeInsets(outInsets)
-        if (outInsets == null) return
+        outInsets ?: return
+
+        val root = inputWindowView
+        if (root == null) {
+            outInsets.touchableInsets = Insets.TOUCHABLE_INSETS_VISIBLE
+            return
+        }
+
+        val w = root.width
+        val h = root.height
+        if (w <= 0 || h <= 0) {
+            outInsets.touchableInsets = Insets.TOUCHABLE_INSETS_VISIBLE
+            outInsets.contentTopInsets = 0
+            outInsets.visibleTopInsets = 0
+            return
+        }
 
         if (dockMode) {
-            val root = inputWindowView ?: return
-            val w = root.width.takeIf { it > 0 } ?: return
-            val h = root.height.takeIf { it > 0 } ?: return
-
-            if (!isInputViewShown) {
-                outInsets.contentTopInsets = h
-                outInsets.visibleTopInsets = h
-                return
-            }
-
             val dock = clampToWindow(dockRectPx, w, h)
-            outInsets.touchableInsets = Insets.TOUCHABLE_INSETS_REGION
-            outInsets.touchableRegion.set(dock.left, dock.top, dock.right, dock.bottom)
+            val safeDock =
+                if (dock.width() > 0 && dock.height() > 0) dock
+                else android.graphics.Rect(0, (h * 0.75f).toInt(), w, h)
+
+            try {
+                outInsets.touchableInsets = Insets.TOUCHABLE_INSETS_REGION
+                outInsets.touchableRegion.set(safeDock.left, safeDock.top, safeDock.right, safeDock.bottom)
+            } catch (t: Throwable) {
+                flogWarning { "touchableRegion.set failed: ${t.javaClass.simpleName}" }
+                outInsets.touchableInsets = Insets.TOUCHABLE_INSETS_VISIBLE
+            }
             outInsets.contentTopInsets = h
             outInsets.visibleTopInsets = h
             return
         }
 
-        val inputWindowView = inputWindowView ?: return
-        // TODO: Check also if the keyboard is currently suppressed by a hardware keyboard
         if (!isInputViewShown) {
-            outInsets.contentTopInsets = inputWindowView.height
-            outInsets.visibleTopInsets = inputWindowView.height
+            outInsets.contentTopInsets = root.height
+            outInsets.visibleTopInsets = root.height
             return
         }
 
-        val visibleTopY = inputWindowView.height - inputViewSize.height
-        val needAdditionalOverlay =
-            prefs.smartbar.enabled.get() &&
-                prefs.smartbar.layout.get() == SmartbarLayout.SUGGESTIONS_ACTIONS_EXTENDED &&
-                prefs.smartbar.extendedActionsExpanded.get() &&
-                prefs.smartbar.extendedActionsPlacement.get() == ExtendedActionsPlacement.OVERLAY_APP_UI &&
-                keyboardManager.activeState.imeUiMode == ImeUiMode.TEXT
-
+        val visibleTopY = root.height - inputViewSize.height
         outInsets.contentTopInsets = visibleTopY
         outInsets.visibleTopInsets = visibleTopY
         outInsets.touchableInsets = Insets.TOUCHABLE_INSETS_REGION
+
         val left = 0
-        val top = if (keyboardManager.activeState.isBottomSheetShowing() || keyboardManager.activeState.isSubtypeSelectionShowing()) {
-            0
-        } else {
-            visibleTopY - if (needAdditionalOverlay) FlorisImeSizing.Static.smartbarHeightPx else 0
+        val top = 0
+        val right = inputViewSize.width.coerceAtLeast(1)
+        val bottom = root.height.coerceAtLeast(1)
+
+        try {
+            outInsets.touchableRegion.set(left, top, right, bottom)
+        } catch (t: Throwable) {
+            flogWarning { "touchableRegion.set failed (classic): ${t.javaClass.simpleName}" }
+            outInsets.touchableInsets = Insets.TOUCHABLE_INSETS_VISIBLE
         }
-        val right = inputViewSize.width
-        val bottom = inputWindowView.height
-        outInsets.touchableRegion.set(left, top, right, bottom)
     }
 
     /**
@@ -929,18 +927,20 @@ class FlorisImeService : LifecycleInputMethodService() {
         }
 
         override fun onAttachedToWindow() {
-            removeView(extractEditText)
+            if (extractEditText.parent === this) {
+                removeView(extractEditText)
+            }
             super.onAttachedToWindow()
             try {
-                (parent as LinearLayout).let { extractEditLayout ->
+                (parent as? ViewGroup)?.let { extractEditLayout ->
                     extractEditLayout.layoutParams = LayoutParams(
-                        LinearLayout.LayoutParams.MATCH_PARENT,
-                        LinearLayout.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.MATCH_PARENT
                     ).also { it.setMargins(0, 0, 0, 0) }
                     extractEditLayout.setPadding(0, 0, 0, 0)
                 }
             } catch (e: Throwable) {
-                flogError { e.message.toString() }
+                flogError { "ComposeExtractedLandscapeInputView parent tweak: ${e.message}" }
             }
         }
     }
